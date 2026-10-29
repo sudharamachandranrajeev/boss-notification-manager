@@ -1,15 +1,18 @@
 {
   "schemaVersion": 1,
-  "id": "omarchy.notifications",
-  "name": "Notifications",
-  "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Notification daemon, popups, DND, and history",
+  "id": "boss.notifications",
+  "name": "BOSS Notification Manager",
+  "version": "0.1.0",
+  "author": "BOSS (BrahmaOS Shell Suite)",
+  "description": "Omarchy notifications with a close button, timed fade-out and a notification center",
   "kinds": [
     "service"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.notifications"
   }
 }

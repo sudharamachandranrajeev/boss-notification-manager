@@ -3,10 +3,12 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import Quickshell.Wayland
 import Quickshell.Services.Notifications
 import qs.Commons
+import qs.Ui
 
 import "components"
 import "NotificationLogic.js" as NotificationLogic
@@ -30,8 +32,8 @@ Item {
   // acted upon.
   readonly property string popupStateDir: stateDir + "notifications/"
   // The notifications that already left the screen, one file each, trimmed to
-  // the newest historyLimit. This directory IS the history: `showHistory`
-  // replays exactly what has been moved in here.
+  // the newest historyLimit. This directory IS the history: the notification
+  // center (`showHistory`) lists exactly what has been moved in here.
   readonly property string historyDir: popupStateDir + "history/"
   // Copies of the avatars/images persisted entries reference — the sender's
   // originals don't outlive the notification (see persistablePopup). Each
@@ -92,17 +94,24 @@ Item {
   ListModel { id: popupModel }
 
   // How many notifications the history directory keeps, and therefore how
-  // many `showHistory` can replay.
-  readonly property int historyLimit: 10
+  // many the notification center can list.
+  readonly property int historyLimit: 50
 
   readonly property int lowPopupDuration: 5000
   readonly property int normalPopupDuration: 8000
   readonly property int maxPopupDuration: 30000
+  // The freedesktop spec says critical toasts should not expire, and Omarchy
+  // follows it. With no visible way to dismiss them that left crash toasts on
+  // screen for good, so BOSS gives them the longest toast lifetime instead.
+  // Hovering still pauses the countdown, and the toast stays in history.
+  readonly property int criticalPopupDuration: maxPopupDuration
+  // How long a toast takes to fade out once it times out or is closed.
+  readonly property int fadeDuration: 250
 
   function durationFor(urgency, expireTimeout) {
     switch (urgency) {
     case NotificationUrgency.Critical:
-      return 0
+      return criticalPopupDuration
     case NotificationUrgency.Low:
       return Math.min(maxPopupDuration, Math.max(lowPopupDuration, requestedDuration(expireTimeout)))
     default:
@@ -559,7 +568,7 @@ Item {
   // A silenced notification is untracked the moment it arrives, so the server
   // has nothing left for a later replaces_id to replace and hands the sender a
   // fresh id instead. Every update from a chatty thread is therefore its own
-  // notification here, and several can sit in the ten slots together — there
+  // notification here, and several can sit in the history slots together — there
   // is no id to recognize them by, and guessing from app and summary would
   // merge genuinely separate messages.
   function writeHistoryFile(entry, done) {
@@ -629,10 +638,15 @@ Item {
   // showHistory while one is still waiting its turn doesn't queue another.
   property bool historyReadQueued: false
 
-  // Re-show what's in historyDir as toasts. The read goes through the file
-  // queue and its own subprocess, so the replay lands in replayHistory once
-  // the work queued ahead of it has finished.
+  // Open the notification center with what's in historyDir, or close it if
+  // it is open. The read goes through the file queue and its own subprocess,
+  // so the list lands in replayHistory once the work queued ahead of it has
+  // finished.
   function showRecentHistory() {
+    if (service.centerOpen) {
+      closeCenter()
+      return "ok"
+    }
     if (readHistoryProc.running || service.historyReadQueued) return "ok"
     service.replayCarryOver = liveRowsForReplay()
     service.historyReadQueued = true
@@ -674,39 +688,69 @@ Item {
     return rows
   }
 
+  // Fill the notification center and open it. The toasts on screen are in
+  // the list too (carried over, see showRecentHistory), so they leave the
+  // screen: one place shows everything, and nothing sits on top of the panel.
   function replayHistory(raw) {
     var rows = NotificationLogic.historyRows(
       raw, service.replayCarryOver, NotificationUrgency.Normal, service.historyLimit)
     service.replayCarryOver = []
 
-    // Replaying nothing at all looks like a dead keybinding, so say so.
-    if (rows.length === 0) {
-      popupModel.insert(0, {
-        id: -1,
-        originalId: -1,
-        app: "omarchy-action",
-        appIcon: "",
-        summary: "No recent notifications",
-        body: "",
-        image: "",
-        glyph: "󰂚",
-        execArgv: "",
-        urgency: NotificationUrgency.Low,
-        expireTimeout: 0,
-        timestamp: Date.now()
-      })
-      return
-    }
-
     clearPopups()
-    // Rows arrive newest-first, and index 0 is the top of the toast stack.
-    for (var i = 0; i < rows.length; i++) {
-      // Replayed rows are restored rows: their notification died with the
-      // sender long ago, so they must never resolve to a live server object
-      // that has since been handed their old id.
-      service.restoredPopups[NotificationLogic.popupFileName(rows[i])] = true
-      popupModel.append(rows[i])
-    }
+    centerModel.clear()
+    // Rows arrive newest-first, the order the center lists them in.
+    for (var i = 0; i < rows.length; i++) centerModel.append(rows[i])
+    service.centerScreen = focusedScreenName()
+    service.centerOpen = true
+  }
+
+  // ---------------------------------------------------- notification center
+  //
+  // A panel listing historyDir, newest first. Its rows are history entries:
+  // their senders are gone, so a click runs only what the file kept (an
+  // Omarchy toast's argv) or focuses the sending app.
+
+  property bool centerOpen: false
+  // The monitor the center opened on, fixed while it stays open so it does
+  // not jump when focus moves.
+  property string centerScreen: ""
+  property alias centerModel: centerModel
+  ListModel { id: centerModel }
+
+  function focusedScreenName() {
+    var monitor = Hyprland.focusedMonitor
+    return monitor ? String(monitor.name || "") : ""
+  }
+
+  function closeCenter() {
+    service.centerOpen = false
+    centerModel.clear()
+  }
+
+  // Delete one entry's history file and image copies, and its row.
+  function forgetHistoryEntry(index) {
+    if (index < 0 || index >= centerModel.count) return
+    var row = centerModel.get(index)
+    enqueuePopupFileJob(["bash", "-c",
+      "rm -f \"$1/$2.json\" \"$3/$2\"-*", "--",
+      historyDir, NotificationLogic.imageStem(row), imagesDir])
+    centerModel.remove(index)
+  }
+
+  function clearCenter() {
+    clearHistory()
+    centerModel.clear()
+  }
+
+  // Same order as invokePopupDefault, minus the live libnotify actions a
+  // history entry no longer has. The entry stays in history.
+  function invokeHistoryEntry(index) {
+    if (index < 0 || index >= centerModel.count) return
+    var row = centerModel.get(index)
+    var argv = NotificationLogic.parseExecArgv(row ? row.execArgv : "")
+    if (argv) Util.execArgv(argv)
+    else focusApp(row)
+    closeCenter()
   }
 
   Process {
@@ -877,14 +921,24 @@ Item {
       return dndState()
     }
 
-    // Replay the notifications that have been moved into the history dir.
+    // Open the notification center, or close it when it is open. The name is
+    // the built-in's, so Omarchy's history keybinding opens the center.
     function showHistory(): string {
       return service.showRecentHistory()
     }
 
+    function toggleCenter(): string {
+      return service.showRecentHistory()
+    }
+
+    function closeCenter(): string {
+      service.closeCenter()
+      return "ok"
+    }
+
     // `clear` forgets the recorded history; the toasts on screen stay put.
     function clear(): string {
-      service.clearHistory()
+      service.clearCenter()
       return "ok"
     }
 
@@ -956,7 +1010,8 @@ Item {
       id: popupWindow
       required property var modelData
       screen: modelData
-      visible: popupModel.count > 0
+      // The notification center takes the toasts' place while it is open.
+      visible: popupModel.count > 0 && !service.centerOpen
 
       WlrLayershell.namespace: "omarchy-notifications"
       WlrLayershell.layer: WlrLayer.Overlay
@@ -1012,7 +1067,10 @@ Item {
 
             readonly property real lifetime: service.durationFor(cardSlot.urgency, cardSlot.expireTimeout)
             property real remainingLifetime: 1.0
+            // Set while the card fades out on its way off the screen.
+            property bool leaving: false
             readonly property bool ticking: cardSlot.lifetime > 0 && !card.hovered
+              && !cardSlot.leaving && !service.centerOpen
 
             // A client updating this notification in place rewrites the row
             // under the card (see refreshPopup). New text deserves a full look,
@@ -1020,9 +1078,43 @@ Item {
             // superseded text was already most of the way through. Delegates
             // keep their own row as the model changes around them, so only a
             // real content change lands here.
-            onSummaryChanged: cardSlot.remainingLifetime = 1.0
-            onBodyChanged: cardSlot.remainingLifetime = 1.0
-            onImageChanged: cardSlot.remainingLifetime = 1.0
+            onSummaryChanged: cardSlot.freshLook()
+            onBodyChanged: cardSlot.freshLook()
+            onImageChanged: cardSlot.freshLook()
+
+            // A timed-out card fading away comes back for new text; one the
+            // user closed keeps going.
+            function freshLook() {
+              cardSlot.remainingLifetime = 1.0
+              if (cardSlot.leaving && fadeOut.expired) {
+                fadeOut.stop()
+                card.opacity = 1
+                cardSlot.leaving = false
+              }
+            }
+
+            // Fade out, then remove the row. The index is read when the fade
+            // ends, since toasts arriving meanwhile shift it.
+            function leave(expired) {
+              if (cardSlot.leaving) return
+              cardSlot.leaving = true
+              fadeOut.expired = expired
+              fadeOut.start()
+            }
+
+            NumberAnimation {
+              id: fadeOut
+              property bool expired: false
+              target: card
+              property: "opacity"
+              to: 0
+              duration: service.fadeDuration
+              easing.type: Easing.InCubic
+              onFinished: {
+                if (fadeOut.expired) service.expirePopup(cardSlot.index)
+                else service.dismissPopup(cardSlot.index)
+              }
+            }
 
             Timer {
               interval: 50
@@ -1033,7 +1125,7 @@ Item {
                 cardSlot.remainingLifetime -= 50.0 / cardSlot.lifetime
                 if (cardSlot.remainingLifetime <= 0) {
                   cardSlot.remainingLifetime = 0
-                  service.expirePopup(cardSlot.index)
+                  cardSlot.leave(true)
                 }
               }
             }
@@ -1051,9 +1143,160 @@ Item {
               cornerRadius: service.cornerRadius
               fontFamily: service.shell && service.shell.bar ? service.shell.bar.fontFamily : ""
               glyph: cardSlot.glyph
+              enabled: !cardSlot.leaving
 
-              onCloseRequested: service.dismissPopup(cardSlot.index)
+              onCloseRequested: cardSlot.leave(false)
               onCardClicked: service.invokePopupDefault(cardSlot.index)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ---------------------------------------------------- notification center UI
+  //
+  // Full-screen and transparent on the monitor it opened on, so a click
+  // outside the panel closes it, and it takes the keyboard for Esc. The panel
+  // sits where the toasts do.
+
+  Variants {
+    model: Quickshell.screens
+
+    PanelWindow {
+      id: centerWindow
+      required property var modelData
+      screen: modelData
+      visible: service.centerOpen
+        && (service.centerScreen === "" || service.centerScreen === String(modelData.name || ""))
+
+      WlrLayershell.namespace: "boss-notification-center"
+      WlrLayershell.layer: WlrLayer.Overlay
+      WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+      exclusionMode: ExclusionMode.Ignore
+      color: "transparent"
+      anchors { top: true; bottom: true; left: true; right: true }
+
+      readonly property var popupPlacement: NotificationLogic.popupPlacement(
+        service.barPosition, service.barClearance, Style.gapsOut)
+
+      MouseArea {
+        anchors.fill: parent
+        onClicked: service.closeCenter()
+      }
+
+      BorderSurface {
+        id: centerPanel
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.topMargin: centerWindow.popupPlacement.margins.top
+        anchors.rightMargin: centerWindow.popupPlacement.margins.right
+        width: Style.space(400)
+        // The column's implicit height leaves out its anchor margins.
+        height: Math.min(centerColumn.implicitHeight + centerColumn.anchors.topMargin
+            + centerColumn.anchors.bottomMargin,
+          centerWindow.height - anchors.topMargin - Style.gapsOut)
+        radius: service.cornerRadius
+        color: Color.notifications.background
+        borderSpec: Border.surfaceSpec("notifications", "border", Color.notifications.border, Math.max(1, Style.space(2)))
+        clip: true
+
+        // Swallow clicks on the panel's own background.
+        MouseArea { anchors.fill: parent }
+
+        PanelKeyCatcher {
+          anchors.fill: parent
+          onCloseRequested: service.closeCenter()
+
+          ColumnLayout {
+            id: centerColumn
+            anchors.fill: parent
+            anchors.topMargin: centerPanel.borderTop + Style.space(10)
+            anchors.bottomMargin: centerPanel.borderBottom + Style.space(10)
+            anchors.leftMargin: centerPanel.borderLeft + Style.space(10)
+            anchors.rightMargin: centerPanel.borderRight + Style.space(10)
+            spacing: Style.space(8)
+
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+
+              Text {
+                Layout.fillWidth: true
+                textFormat: Text.PlainText
+                text: centerModel.count > 0 ? "Notifications (" + centerModel.count + ")" : "Notifications"
+                font.family: "Liberation Sans"
+                font.bold: true
+                font.pixelSize: Style.font.title
+                color: Color.notifications.text
+              }
+
+              Button {
+                visible: centerModel.count > 0
+                text: "Clear all"
+                foreground: Color.notifications.text
+                bordered: true
+                onClicked: service.clearCenter()
+              }
+            }
+
+            Text {
+              visible: centerModel.count === 0
+              Layout.fillWidth: true
+              Layout.topMargin: Style.space(6)
+              Layout.bottomMargin: Style.space(6)
+              textFormat: Text.PlainText
+              text: "No notifications"
+              font.family: "Liberation Sans"
+              font.pixelSize: Style.font.body
+              color: Qt.darker(Color.notifications.text, 1.4)
+            }
+
+            ListView {
+              id: centerList
+              visible: centerModel.count > 0
+              Layout.fillWidth: true
+              Layout.fillHeight: true
+              Layout.preferredHeight: contentHeight
+              clip: true
+              spacing: Style.space(6)
+              boundsBehavior: Flickable.StopAtBounds
+              model: centerModel
+
+              delegate: Item {
+                id: centerRow
+                required property int index
+                required property string app
+                required property string appIcon
+                required property string summary
+                required property string body
+                required property string image
+                required property string glyph
+                required property int urgency
+                required property double timestamp
+
+                width: centerList.width
+                implicitHeight: centerCard.implicitHeight
+
+                NotificationCard {
+                  id: centerCard
+                  width: parent.width
+                  app: centerRow.app
+                  appIcon: centerRow.appIcon
+                  summary: centerRow.summary
+                  body: centerRow.body
+                  image: centerRow.image
+                  glyph: centerRow.glyph
+                  urgency: centerRow.urgency
+                  timestamp: centerRow.timestamp
+                  cornerRadius: service.cornerRadius
+                  fontFamily: service.shell && service.shell.bar ? service.shell.bar.fontFamily : ""
+                  timeText: NotificationLogic.timeLabel(centerRow.timestamp, Date.now())
+
+                  onCloseRequested: service.forgetHistoryEntry(centerRow.index)
+                  onCardClicked: service.invokeHistoryEntry(centerRow.index)
+                }
+              }
             }
           }
         }

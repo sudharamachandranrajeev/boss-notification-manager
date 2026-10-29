@@ -279,7 +279,8 @@ function parseSettings(raw) {
 // (e.g. the restart `omarchy-update` performs). The file exists exactly as
 // long as the popup is on screen: it is written when the toast appears and
 // moved into the history/ subdirectory when the toast expires, is dismissed,
-// or its action is invoked. History is those moved files, newest last-10.
+// or its action is invoked. History is those moved files, the newest
+// historyLimit of them (Service.qml).
 
 function popupEntry(value, normalUrgency) {
   var entry = historyEntry(value, normalUrgency)
@@ -446,8 +447,28 @@ function historyRows(raw, liveRows, normalUrgency, limit) {
   return out.slice(0, max)
 }
 
+// When a notification center row arrived: "14:05" today, "Yesterday 14:05",
+// then "Mon 14:05" within the week and "3 Oct 14:05" before that. Local time;
+// a missing or future timestamp shows only the clock.
+function timeLabel(timestampMs, nowMs) {
+  var t = new Date(Number(timestampMs) || 0)
+  var now = new Date(Number(nowMs) || Date.now())
+  function pad(n) { return (n < 10 ? "0" : "") + n }
+  var clock = pad(t.getHours()) + ":" + pad(t.getMinutes())
+  var dayMs = 24 * 60 * 60 * 1000
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  var day = new Date(t.getFullYear(), t.getMonth(), t.getDate()).getTime()
+  var daysAgo = Math.round((today - day) / dayMs)
+  if (daysAgo <= 0) return clock
+  if (daysAgo === 1) return "Yesterday " + clock
+  if (daysAgo < 7) return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][t.getDay()] + " " + clock
+  var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  return t.getDate() + " " + months[t.getMonth()] + " " + clock
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
+    timeLabel: timeLabel,
     isChromiumDerived: isChromiumDerived,
     sanitizeBody: sanitizeBody,
     styledBody: styledBody,

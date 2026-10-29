@@ -27,6 +27,9 @@ BorderSurface {
   property int urgency: 1
   property double timestamp: 0
   property int cornerRadius: 0
+  // When it arrived, shown under the text. The notification center sets it;
+  // toasts leave it empty because they are on screen as it happens.
+  property string timeText: ""
 
   // System monospace font injected by the container.
   property string fontFamily: ""
@@ -157,6 +160,8 @@ BorderSurface {
       ColumnLayout {
         Layout.fillWidth: true
         Layout.alignment: Qt.AlignVCenter
+        // Keep the first line clear of the close button.
+        Layout.rightMargin: Style.space(10)
         spacing: Style.space(2)
 
         Text {
@@ -190,7 +195,48 @@ BorderSurface {
           elide: Text.ElideRight
           maximumLineCount: 3
         }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.topMargin: Style.space(2)
+          visible: root.timeText.length > 0
+          text: root.timeText
+          font.family: "Liberation Sans"
+          color: root.dimColor
+          font.pixelSize: Style.font.caption
+        }
       }
+    }
+  }
+
+  // Close button, after upstream Omarchy 9b72edcc9 but always shown: a
+  // critical toast used to have no visible way out at all. Dim until the
+  // pointer is over the card. Stacked after mainColumn so its MouseArea sits
+  // above the full-card one and the click never reaches cardClicked.
+  Item {
+    anchors.top: parent.top
+    anchors.right: parent.right
+    anchors.topMargin: root.borderTop + Style.space(3)
+    anchors.rightMargin: root.borderRight + Style.space(3)
+    width: Style.space(18)
+    height: Style.space(18)
+    opacity: root.hovered ? 1 : 0.5
+
+    Behavior on opacity { NumberAnimation { duration: 100 } }
+
+    Text {
+      anchors.centerIn: parent
+      text: "✕"
+      color: closeArea.containsMouse ? Color.notifications.text : root.dimColor
+      font.pixelSize: Math.round(Style.font.caption * 1.44)
+    }
+
+    MouseArea {
+      id: closeArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.closeRequested()
     }
   }
 
